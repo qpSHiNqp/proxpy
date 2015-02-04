@@ -1,23 +1,26 @@
 """
   Copyright notice
   ================
-  
+
+  Copyright (C) 2015
+      Shintaro Tanaka     <qpshinqp@mist-t.co.jp>
+
   Copyright (C) 2011
       Roberto Paleari     <roberto.paleari@gmail.com>
       Alessandro Reina    <alessandro.reina@gmail.com>
-  
+
   This program is free software: you can redistribute it and/or modify it under
   the terms of the GNU General Public License as published by the Free Software
   Foundation, either version 3 of the License, or (at your option) any later
   version.
-  
-  HyperDbg is distributed in the hope that it will be useful, but WITHOUT ANY
+
+  This program is distributed in the hope that it will be useful, but WITHOUT ANY
   WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
   A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
-  
+
   You should have received a copy of the GNU General Public License along with
   this program. If not, see <http://www.gnu.org/licenses/>.
-  
+
 """
 
 import SocketServer
@@ -34,6 +37,7 @@ import copy
 from history import *
 from http import *
 from https import *
+from tunnel import *
 from logger import Logger
 
 DEFAULT_CERT_FILE = "./cert/ncerts/proxpy.pem"
@@ -52,22 +56,27 @@ class ProxyHandler(SocketServer.StreamRequestHandler):
         self._port = 0
 
         SocketServer.StreamRequestHandler.__init__(self, request, client_address, server)
-    
-    def createConnection(self, host, port):
+
+    def createConnection(self, host, port): # against origin
         global proxystate
 
-        if self.target and self._host == host:
+        if self.target and self._host == host: # if keep-alive connection exists
             return self.target
 
         try:
             # If a SSL tunnel was established, create a HTTPS connection to the server
             if self.peer:
+                # This won't be executed
                 conn = httplib.HTTPSConnection(host, port)
             else:
                 # HTTP Connection
                 conn = httplib.HTTPConnection(host, port)
-        except HTTPException as e:
+        except httplib.HTTPException as e:
             proxystate.log.debug(e.__str__())
+            pass
+        except:
+            proxystate.log.debug("Unexpected error:", sys.exc_info()[0])
+            raise
 
         # If we need a persistent connection, add the socket to the dictionary
         if self.keepalive:
@@ -75,7 +84,7 @@ class ProxyHandler(SocketServer.StreamRequestHandler):
 
         self._host = host
         self._port = port
-            
+
         return conn
 
     def sendResponse(self, res):
@@ -109,7 +118,7 @@ class ProxyHandler(SocketServer.StreamRequestHandler):
         except Exception as e:
             proxystate.log.debug(e.__str__() + ": Error on reading request message")
             return
-            
+
         if req is None:
             return
 
@@ -121,10 +130,10 @@ class ProxyHandler(SocketServer.StreamRequestHandler):
             self.keepalive = True
         else:
             self.keepalive = False
-        
+
         # Target server host and port
         host, port = ProxyState.getTargetHost(req)
-        
+
         if req.getMethod() == HTTPRequest.METHOD_GET:
             res = self.doGET(host, port, req)
             self.sendResponse(res)
@@ -181,29 +190,21 @@ class ProxyHandler(SocketServer.StreamRequestHandler):
         global proxystate
 
         socket_req = self.request
-        certfilename = DEFAULT_CERT_FILE
-        socket_ssl = ssl.wrap_socket(socket_req, server_side = True, certfile = certfilename, 
-                                     ssl_version = ssl.PROTOCOL_SSLv23, do_handshake_on_connect = False)
+
+        # create tunnel to host:port
+        conn = socket.create_connection((host, port))
+        self.peer    = True
 
         HTTPSRequest.sendAck(socket_req)
-        
-        host, port = socket_req.getpeername()
-        proxystate.log.debug("Send ack to the peer %s on port %d for establishing SSL tunnel" % (host, port))
+        chost, cport = socket_req.getpeername()
+        proxystate.log.debug("Sent ack to the peer %s on port %d for establishing SSL tunnel" % (chost, cport))
 
-        while True:
-            try:
-                socket_ssl.do_handshake()
-                break
-            except (ssl.SSLError, IOError):
-                # proxystate.log.error(e.__str__())
-                return
+        # bypass payloads between two sockets
+        TunnelUtil.bridge_forever(conn, self.request)
 
-        # Switch to new socket
-        self.peer    = True
-        self.request = socket_ssl
-
-        self.setup()
-        self.handle()
+        # tunnel session ended
+        self.keepalive = False
+        return None
 
     def _getresponse(self, conn):
         try:
@@ -229,7 +230,7 @@ class ProxyHandler(SocketServer.StreamRequestHandler):
 class ThreadedHTTPProxyServer(SocketServer.ThreadingMixIn, SocketServer.TCPServer):
     allow_reuse_address = True
 
-class ProxyServer():    
+class ProxyServer():
     def __init__(self, init_state):
         global proxystate
         proxystate = init_state
@@ -238,13 +239,13 @@ class ProxyServer():
 
     def startProxyServer(self):
         global proxystate
-        
+
         self.proxyServer = ThreadedHTTPProxyServer((self.proxyServer_host, self.proxyServer_port), ProxyHandler)
 
         # Start a thread with the server (that thread will then spawn a worker
         # thread for each request)
         server_thread = threading.Thread(target = self.proxyServer.serve_forever)
-    
+
         # Exit the server thread when the main thread terminates
         server_thread.setDaemon(True)
         proxystate.log.info("Server %s listening on port %d" % (self.proxyServer_host, self.proxyServer_port))
@@ -291,7 +292,7 @@ class ProxyPlugin:
 
     def __init__(self, filename = None):
         self.filename = filename
-    
+
         if filename is not None:
             import imp
             assert os.path.isfile(filename)
@@ -314,7 +315,7 @@ class ProxyPlugin:
             r = a(*args)
         else:
             r = None
-            
+
         return r
 
     @staticmethod
